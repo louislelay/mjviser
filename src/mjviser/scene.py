@@ -24,6 +24,7 @@ from .conversions import (
   merge_geoms_hull,
   merge_sites,
 )
+from .flex import FlexTube, flex_vertex_positions
 from .interaction import Perturbation
 
 
@@ -35,6 +36,15 @@ class _MeshGroup:
   body_ids: np.ndarray  # (N,) int32 array of body IDs
   group_id: int
   mocap_ids: np.ndarray | None  # (N,) int32 mocap IDs, or None if non-mocap
+
+
+@dataclasses.dataclass
+class _FlexHandle:
+  """A 1D flex rendered as a tube that is re-swept every update."""
+
+  handle: viser.MeshHandle
+  tube: FlexTube
+  group_id: int
 
 
 # Viser visualization defaults.
@@ -179,6 +189,7 @@ class ViserMujocoScene:
     self._decor_handles: dict[tuple[int, bool], viser.BatchedMeshHandle] = {}
     self._fixed_geom_handles: dict[tuple[int, int, int], viser.GlbHandle] = {}
     self._fixed_site_handles: dict[tuple[int, int], viser.GlbHandle] = {}
+    self._flex_handles: list[_FlexHandle] = []
     self._update_lock = RLock()
     self._refresh_handler: Callable[[], None] | None = None
     self._hull_body_meshes: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -255,6 +266,7 @@ class ViserMujocoScene:
     self._register_perturbation_handlers()
     self._add_fixed_sites()
     self._create_site_handles_by_group()
+    self._create_flex_handles()
     self._compute_hull_body_meshes()
     self._build_hull_handles()
 
@@ -364,6 +376,10 @@ class ViserMujocoScene:
         handle.remove()
       self.site_handles_by_group.clear()
 
+      for flex in self._flex_handles:
+        flex.handle.remove()
+      self._flex_handles.clear()
+
       self._clear_hull_handles()
       self._hull_body_meshes.clear()
       self._hull_mesh_bodies.clear()
@@ -374,6 +390,7 @@ class ViserMujocoScene:
       self._register_perturbation_handlers()
       self._add_fixed_sites()
       self._create_site_handles_by_group()
+      self._create_flex_handles()
       self._compute_hull_body_meshes()
       self._build_hull_handles()
       self._sync_visibilities()
@@ -437,6 +454,11 @@ class ViserMujocoScene:
 
     for (_, group_id), handle in self._fixed_site_handles.items():
       handle.visible = group_id < 6 and self.site_groups_visible[group_id]
+
+    for flex in self._flex_handles:
+      flex.handle.visible = (
+        flex.group_id < 6 and self.geom_groups_visible[flex.group_id]
+      )
 
     if not self._any_decor_visible():
       for handle in self._decor_handles.values():
@@ -1164,6 +1186,10 @@ class ViserMujocoScene:
         handle.batched_positions = pos
         handle.batched_wxyzs = quat
 
+      self._update_flex_handles(
+        body_xpos, body_xmat, env_idx, scene_offset, slice_single
+      )
+
       if self._show_convex_hull:
         for handle, body_id in self._hull_dynamic_handles:
           if not handle.visible:
@@ -1496,6 +1522,63 @@ class ViserMujocoScene:
           visible=visible,
         )
         self.site_handles_by_group[(body_id, group_id)] = handle
+
+  def _create_flex_handles(self) -> None:
+    """Create a tube mesh for each 1D flex whose vertices are bodies."""
+    vert_pos = flex_vertex_positions(
+      self.mj_model,
+      self.mj_data.xpos[None],
+      self.mj_data.xmat.reshape(-1, 3, 3)[None],
+    )
+    for flex_id in range(self.mj_model.nflex):
+      # Interpolated flexes place vertices from nodes, not bodies, and 2D and 3D
+      # flexes need a skin rather than a tube.
+      if self.mj_model.flex_dim[flex_id] != 1 or self.mj_model.flex_interp[flex_id]:
+        continue
+      matid = self.mj_model.flex_matid[flex_id]
+      rgba = (
+        self.mj_model.mat_rgba[matid]
+        if matid >= 0
+        else self.mj_model.flex_rgba[flex_id]
+      )
+      group_id = int(self.mj_model.flex_group[flex_id])
+      name = mj_id2name(self.mj_model, mjtObj.mjOBJ_FLEX, flex_id) or f"flex{flex_id}"
+      tube = FlexTube.from_model(self.mj_model, flex_id)
+      vertices, faces = tube.mesh(vert_pos)
+      handle = self.server.scene.add_mesh_simple(
+        f"/flexes/{name}",
+        vertices,
+        faces,
+        color=rgba[:3],
+        opacity=float(rgba[3]) if rgba[3] < 1.0 else None,
+        visible=group_id < 6 and self.geom_groups_visible[group_id],
+      )
+      self._flex_handles.append(_FlexHandle(handle, tube, group_id))
+
+  def _update_flex_handles(
+    self,
+    body_xpos: np.ndarray,
+    body_xmat: np.ndarray,
+    env_idx: int,
+    scene_offset: np.ndarray,
+    slice_single: bool,
+  ) -> None:
+    """Re-sweep each flex tube through its current vertex positions."""
+    if not self._flex_handles:
+      return
+    if slice_single:
+      body_xpos = body_xpos[env_idx : env_idx + 1]
+      body_xmat = body_xmat[env_idx : env_idx + 1]
+    vert_pos = flex_vertex_positions(self.mj_model, body_xpos, body_xmat)
+    vert_pos = vert_pos + scene_offset
+    for flex in self._flex_handles:
+      if not flex.handle.visible:
+        continue
+      vertices, faces = flex.tube.mesh(vert_pos)
+      # Faces only change when the number of rendered environments does.
+      if faces.shape != flex.handle.faces.shape:
+        flex.handle.faces = faces
+      flex.handle.vertices = vertices
 
   def _compute_hull_body_meshes(self) -> None:
     """Precompute one merged convex hull mesh per body that has mesh geoms."""
